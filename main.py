@@ -1,273 +1,418 @@
-from flask import Flask, Response
+from flask import Flask
 import socket
 import struct
-import os
+import time
 
 app = Flask(__name__)
 
-# WON2 master server
-MASTERS = [
+# ============================================================
+# WON2 MASTER SERVERS
+# ============================================================
+
+WON2_MASTERS = [
     ("master.won2.steamlessproject.nl", 27010),
     ("master2.won2.steamlessproject.nl", 27010),
     ("master3.won2.steamlessproject.nl", 27010),
     ("master4.won2.steamlessproject.nl", 27010),
 ]
 
+MASTER_TIMEOUT = 3.0
+
+
+# ============================================================
+# QUERY ONE MASTER
+# ============================================================
 
 def query_master(host, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(5)
-
-    servers = set()
-
-    # Start from beginning of master list
-    start = "0.0.0.0:0"
+    servers = []
 
     try:
-        while True:
+        # Resolve master hostname
+        master_ip = socket.gethostbyname(host)
 
-            # Half-Life / WON master query
-            #
-            # 31          = master query
-            # FF          = region
-            # 0.0.0.0:0   = starting address
-            # \gamedir\cstrike = CS filter
-            #
-            packet = (
-                b"\x31"
-                b"\xff"
-                + start.encode("ascii")
-                + b"\x00"
-                + b"\\gamedir\\cstrike"
-                + b"\x00"
-            )
-
-            print(
-                "TX:",
-                packet.hex(" ")
-            )
-
-            sock.sendto(
-                packet,
-                (host, port)
-            )
-
-            data, address = sock.recvfrom(8192)
-
-            print(
-                "RX:",
-                len(data),
-                "bytes"
-            )
-
-            print(
-                data.hex(" ")
-            )
-
-            # Master response header
-            if not data.startswith(
-                b"\xff\xff\xff\xff\x66\x0a"
-            ):
-                print(
-                    "Invalid master response"
-                )
-                break
-
-            # Skip FF FF FF FF 66 0A
-            payload = data[6:]
-
-            if len(payload) < 6:
-                break
-
-            previous_start = start
-            last_server = None
-
-            # Every server entry is exactly:
-            #
-            # 4 bytes IP
-            # 2 bytes PORT
-            #
-            # Port is NETWORK ORDER / BIG-ENDIAN
-            for offset in range(
-                0,
-                len(payload) - 5,
-                6
-            ):
-
-                ip_bytes = payload[
-                    offset:offset + 4
-                ]
-
-                port_bytes = payload[
-                    offset + 4:offset + 6
-                ]
-
-                # End-of-list marker
-                if ip_bytes == b"\x00\x00\x00\x00":
-                    break
-
-                try:
-                    ip = socket.inet_ntoa(
-                        ip_bytes
-                    )
-                except Exception:
-                    continue
-
-                # IMPORTANT:
-                # Master-server ports are network ordered.
-                #
-                # Example:
-                # 69 87 = 27015
-                server_port = struct.unpack(
-                    ">H",
-                    port_bytes
-                )[0]
-
-                # Ignore invalid port
-                if server_port == 0:
-                    break
-
-                server = "{}:{}".format(
-                    ip,
-                    server_port
-                )
-
-                print(
-                    "FOUND:",
-                    server,
-                    "| RAW:",
-                    ip_bytes.hex(" "),
-                    port_bytes.hex(" ")
-                )
-
-                servers.add(server)
-
-                last_server = server
-
-            # No usable server returned
-            if last_server is None:
-                break
-
-            # Continue from the last server
-            start = last_server
-
-            # Prevent infinite loop
-            if start == previous_start:
-                break
-
-    except socket.timeout:
-        print(
-            "TIMEOUT:",
-            host,
-            port
+        # Half-Life/WON master query
+        #
+        # 31       = server list request
+        # FF       = region / all regions
+        # 0.0.0.0:0
+        # \gamedir\cstrike
+        #
+        packet = (
+            b"\x31"
+            b"\xff"
+            + b"0.0.0.0:0".encode("ascii")
+            + b"\x00"
+            + b"\\gamedir\\cstrike"
+            + b"\x00"
         )
 
-    except Exception as e:
-        print(
-            "ERROR:",
-            repr(e)
-        )
+        print()
+        print("MASTER:", host, port)
+        print("TX:", packet.hex(" "))
 
-    finally:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(MASTER_TIMEOUT)
+
+        start_time = time.time()
+
+        sock.sendto(packet, (master_ip, port))
+
+        data, address = sock.recvfrom(65535)
+
+        elapsed = (time.time() - start_time) * 1000
+
         sock.close()
 
-    return servers
+        print("RX:", len(data), "bytes")
+        print(data.hex(" "))
+        print("Ping:", round(elapsed, 2), "ms")
 
+        # ----------------------------------------------------
+        # Check WON/GoldSrc master response header
+        # FF FF FF FF 66 0A
+        # ----------------------------------------------------
+
+        if not data.startswith(
+            b"\xff\xff\xff\xff\x66\x0a"
+        ):
+            print("INVALID MASTER RESPONSE HEADER")
+            return servers
+
+        # Server records begin immediately after:
+        #
+        # FF FF FF FF 66 0A
+        #
+        # Each server:
+        #
+        # 4 bytes IP
+        # 2 bytes PORT
+        #
+        offset = 6
+
+        while offset + 6 <= len(data):
+
+            ip_bytes = data[offset:offset + 4]
+            port_bytes = data[offset + 4:offset + 6]
+
+            # IP
+            ip = ".".join(str(x) for x in ip_bytes)
+
+            # IMPORTANT:
+            # WON master server ports are NETWORK ORDER / BIG ENDIAN
+            port_number = struct.unpack(
+                ">H",
+                port_bytes
+            )[0]
+
+            # ------------------------------------------------
+            # REAL END OF LIST
+            #
+            # Only 0.0.0.0:0 is the terminator.
+            #
+            # 0.0.0.0:<nonzero port> is NOT a terminator.
+            # ------------------------------------------------
+
+            if ip == "0.0.0.0" and port_number == 0:
+                print("END OF MASTER LIST")
+                break
+
+            server = f"{ip}:{port_number}"
+
+            servers.append(server)
+
+            print(
+                "FOUND:",
+                server,
+                "| RAW:",
+                ip_bytes.hex(" "),
+                port_bytes.hex(" ")
+            )
+
+            offset += 6
+
+        return servers
+
+    except socket.timeout:
+        print("TIMEOUT:", host)
+        return servers
+
+    except Exception as e:
+        print("ERROR:", host, str(e))
+        return servers
+
+
+# ============================================================
+# QUERY ALL MASTERS
+# ============================================================
+
+def get_all_servers():
+
+    all_servers = []
+    master_results = []
+
+    for host, port in WON2_MASTERS:
+
+        servers = query_master(host, port)
+
+        master_results.append({
+            "host": host,
+            "port": port,
+            "servers": servers
+        })
+
+        all_servers.extend(servers)
+
+    # --------------------------------------------------------
+    # Remove duplicates while keeping order
+    # --------------------------------------------------------
+
+    unique_servers = []
+
+    seen = set()
+
+    for server in all_servers:
+
+        if server not in seen:
+            seen.add(server)
+            unique_servers.append(server)
+
+    return unique_servers, master_results
+
+
+# ============================================================
+# WEB PAGE
+# ============================================================
 
 @app.route("/")
 def index():
 
-    all_servers = set()
-    master_results = []
+    servers, master_results = get_all_servers()
 
-    for master_host, master_port in MASTERS:
+    html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1">
 
-        found = query_master(
-            master_host,
-            master_port
-        )
+    <title>WON2 Master Server Browser</title>
 
-        all_servers.update(found)
+    <style>
 
-        master_results.append(
-            "{}:{} -> {} servers".format(
-                master_host,
-                master_port,
-                len(found)
-            )
-        )
+        body {
+            font-family: Arial, sans-serif;
+            background: #111;
+            color: #eee;
+            margin: 0;
+            padding: 20px;
+        }
 
-    lines = []
+        .container {
+            max-width: 1000px;
+            margin: auto;
+        }
 
-    lines.append(
-        "WON2 MASTER SERVER BROWSER"
-    )
+        h1 {
+            margin-bottom: 5px;
+        }
 
-    lines.append(
-        "========================================"
-    )
+        .subtitle {
+            color: #aaa;
+            margin-bottom: 25px;
+        }
 
-    lines.append("")
+        .stats {
+            background: #1d1d1d;
+            border: 1px solid #333;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 6px;
+        }
 
-    lines.append(
-        "Servers found: {}".format(
-            len(all_servers)
-        )
-    )
+        .stats strong {
+            color: #6db3ff;
+        }
 
-    lines.append("")
+        .master {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-radius: 6px;
+        }
 
-    lines.append(
-        "MASTER RESULTS"
-    )
+        .master-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
 
-    lines.append(
-        "----------------------------------------"
-    )
+        .master-count {
+            color: #7bd88f;
+        }
+
+        .servers {
+            background: #080808;
+            border: 1px solid #292929;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .server {
+            padding: 5px 0;
+            border-bottom: 1px solid #222;
+        }
+
+        .server:last-child {
+            border-bottom: none;
+        }
+
+        .number {
+            color: #777;
+            display: inline-block;
+            width: 45px;
+        }
+
+        .ip {
+            color: #6db3ff;
+        }
+
+        .refresh {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 10px 16px;
+            background: #2b6cb0;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+        }
+
+        .refresh:hover {
+            background: #357dcc;
+        }
+
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>WON2 Master Server Browser</h1>
+
+    <div class="subtitle">
+        Direct Half-Life / WON2 master server query
+    </div>
+"""
+
+    # --------------------------------------------------------
+    # Statistics
+    # --------------------------------------------------------
+
+    html += f"""
+    <div class="stats">
+        <div>
+            <strong>Servers found:</strong>
+            {len(servers)}
+        </div>
+
+        <div>
+            <strong>Masters queried:</strong>
+            {len(master_results)}
+        </div>
+    </div>
+"""
+
+    # --------------------------------------------------------
+    # Master results
+    # --------------------------------------------------------
+
+    html += """
+    <h2>Master Results</h2>
+"""
 
     for result in master_results:
-        lines.append(result)
 
-    lines.append("")
+        html += f"""
+    <div class="master">
 
-    lines.append(
-        "SERVERS"
-    )
+        <div class="master-title">
+            {result["host"]}:{result["port"]}
+        </div>
 
-    lines.append(
-        "----------------------------------------"
-    )
+        <div class="master-count">
+            {len(result["servers"])} servers
+        </div>
 
-    for server in sorted(
-        all_servers,
-        key=lambda x: (
-            x.split(":")[0],
-            int(x.split(":")[1])
-        )
-    ):
-        lines.append(server)
+    </div>
+"""
 
-    return Response(
-        "\n".join(lines),
-        mimetype="text/plain"
-    )
+    # --------------------------------------------------------
+    # Server list
+    # --------------------------------------------------------
 
+    html += """
+    <h2>Servers</h2>
+
+    <div class="servers">
+"""
+
+    if not servers:
+
+        html += """
+        No servers found.
+"""
+
+    else:
+
+        for i, server in enumerate(servers, 1):
+
+            html += f"""
+        <div class="server">
+            <span class="number">{i}.</span>
+            <span class="ip">{server}</span>
+        </div>
+"""
+
+    html += """
+    </div>
+
+    <a class="refresh" href="/">
+        Refresh
+    </a>
+
+</div>
+
+</body>
+</html>
+"""
+
+    return html
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.route("/health")
 def health():
-    return "OK"
 
+    return {
+        "status": "ok"
+    }
+
+
+# ============================================================
+# RUN LOCALLY
+# ============================================================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            "5000"
-        )
-    )
-
     app.run(
         host="0.0.0.0",
-        port=port
+        port=10000,
+        debug=False
     )
