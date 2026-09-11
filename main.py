@@ -5,11 +5,9 @@ import os
 
 app = Flask(__name__)
 
+# WON2 master servers
 MASTERS = [
     ("master.won2.steamlessproject.nl", 27010),
-    ("master2.won2.steamlessproject.nl", 27010),
-    ("master3.won2.steamlessproject.nl", 27010),
-    ("master4.won2.steamlessproject.nl", 27010),
 ]
 
 
@@ -18,74 +16,127 @@ def query_master(host, port):
     sock.settimeout(5)
 
     servers = set()
+
+    # First request starts at 0.0.0.0:0
     start = "0.0.0.0:0"
 
     try:
         while True:
-            # WON/GoldSrc master query
+
+            # WON/WON2 master query
             packet = (
-                b"\x31"
-                + b"\xff"
-                + start.encode("ascii")
-                + b"\x00"
+                b"\x31" +
+                b"\xff" +
+                start.encode("ascii") +
+                b"\x00"
+            )
+
+            print(
+                "TX",
+                host,
+                port,
+                packet.hex(" ")
             )
 
             sock.sendto(packet, (host, port))
 
-            data, addr = sock.recvfrom(8192)
+            data, address = sock.recvfrom(8192)
 
             print(
-                "MASTER",
-                host,
                 "RX",
+                host,
+                port,
                 len(data),
-                "bytes:",
-                data.hex(" ")
+                "bytes"
             )
 
-            if not data.startswith(b"\xff\xff\xff\xff\x66\x0a"):
-                print("Unexpected master response")
+            print(data.hex(" "))
+
+            # Expected master response:
+            # FF FF FF FF 66 0A
+            if not data.startswith(
+                b"\xff\xff\xff\xff\x66\x0a"
+            ):
+                print(
+                    "Unexpected response from",
+                    host,
+                    port
+                )
                 break
 
             payload = data[6:]
 
+            # Every server entry:
+            #
+            # 4 bytes IPv4
+            # 2 bytes port
+            #
+            # Total = 6 bytes
             if len(payload) < 6:
                 break
 
             previous_start = start
             last_server = None
 
-            # EXACTLY 6 bytes per server:
-            # 4-byte IPv4 + 2-byte big-endian port
             for i in range(0, len(payload) - 5, 6):
+
                 ip_bytes = payload[i:i + 4]
                 port_bytes = payload[i + 4:i + 6]
 
-                ip = socket.inet_ntoa(ip_bytes)
-                server_port = struct.unpack(">H", port_bytes)[0]
+                try:
+                    ip = socket.inet_ntoa(ip_bytes)
+                except Exception:
+                    continue
 
-                # End marker
+                # WON/WON2 port
+                # LITTLE-ENDIAN
+                server_port = struct.unpack(
+                    "<H",
+                    port_bytes
+                )[0]
+
+                # Ignore empty entry
                 if ip == "0.0.0.0" and server_port == 0:
                     continue
 
-                address = "{}:{}".format(ip, server_port)
+                server = "{}:{}".format(
+                    ip,
+                    server_port
+                )
 
-                servers.add(address)
-                last_server = address
+                print(
+                    "FOUND:",
+                    server
+                )
 
+                servers.add(server)
+
+                last_server = server
+
+            # Nothing new
             if last_server is None:
                 break
 
+            # Continue from last server returned
             start = last_server
 
+            # Prevent infinite loop
             if start == previous_start:
                 break
 
+    except socket.timeout:
+        print(
+            "TIMEOUT:",
+            host,
+            port
+        )
+
     except Exception as e:
         print(
-            "MASTER ERROR {}:{} -> {}".format(
-                host, port, repr(e)
-            )
+            "ERROR:",
+            host,
+            port,
+            repr(e)
         )
 
     finally:
@@ -96,37 +147,78 @@ def query_master(host, port):
 
 @app.route("/")
 def index():
-    all_servers = set()
-    errors = []
 
-    for host, port in MASTERS:
-        try:
-            found = query_master(host, port)
-            all_servers.update(found)
-        except Exception as e:
-            errors.append(
-                "{}:{} -> {}".format(host, port, repr(e))
+    all_servers = set()
+    master_results = []
+
+    for master_host, master_port in MASTERS:
+
+        found = query_master(
+            master_host,
+            master_port
+        )
+
+        all_servers.update(found)
+
+        master_results.append(
+            "{}:{} -> {} servers".format(
+                master_host,
+                master_port,
+                len(found)
             )
+        )
 
     lines = []
 
-    lines.append("WON2 MASTER SERVER BROWSER")
-    lines.append("=" * 40)
-    lines.append("")
-    lines.append("Servers found: {}".format(len(all_servers)))
+    lines.append(
+        "WON2 MASTER SERVER BROWSER"
+    )
+
+    lines.append(
+        "========================================"
+    )
+
     lines.append("")
 
-    for server in sorted(all_servers):
+    lines.append(
+        "Servers found: {}".format(
+            len(all_servers)
+        )
+    )
+
+    lines.append("")
+
+    # Master statistics
+    lines.append(
+        "MASTER RESULTS"
+    )
+
+    lines.append(
+        "----------------------------------------"
+    )
+
+    for result in master_results:
+        lines.append(result)
+
+    lines.append("")
+
+    lines.append(
+        "SERVERS"
+    )
+
+    lines.append(
+        "----------------------------------------"
+    )
+
+    # Raw IP:PORT
+    for server in sorted(
+        all_servers,
+        key=lambda x: (
+            x.split(":")[0],
+            int(x.split(":")[1])
+        )
+    ):
         lines.append(server)
-
-    if errors:
-        lines.append("")
-        lines.append("=" * 40)
-        lines.append("ERRORS")
-        lines.append("=" * 40)
-
-        for error in errors:
-            lines.append(error)
 
     return Response(
         "\n".join(lines),
@@ -140,7 +232,15 @@ def health():
 
 
 if __name__ == "__main__":
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            "5000"
+        )
+    )
+
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000))
+        port=port
     )
