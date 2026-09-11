@@ -14,43 +14,29 @@ MASTERS = [
 ]
 
 MASTER_PORT = 27010
-GAME_FILTER = b"\\gamedir\\*\\0"
+GAME_FILTER = b"\\gamedir\\*" + b"\x00"  # FIXED: null byte terminator
 
 
 def parse_master_response(data):
     """
     Parse WON2 master response.
 
-    Header: FF FF FF FF 66 0A
-    Then: variable-length hash cursor
-    Then: 6-byte records (4 IP + 2 port big-endian)
+    Header: FF FF FF FF 66 0A (6 bytes)
+    Cursor: 4 bytes little-endian
+    Records: 6 bytes each (4 IP + 2 port big-endian)
     """
-    if len(data) < 8:
+    if len(data) < 10:
         return [], 0
 
     if data[:5] != b"\xff\xff\xff\xff\x66":
         return [], 0
 
-    # Find start of first valid server record.
-    # Rule: first 6-byte window where IP != 0.0.0.0 and port > 1024.
-    start = None
-    for offset in range(6, min(len(data) - 5, 20)):
-        ip_bytes = data[offset:offset + 4]
-        port_bytes = data[offset + 4:offset + 6]
-        port = int.from_bytes(port_bytes, "big")
-        if ip_bytes[0] != 0 and port > 1024:
-            start = offset
-            break
+    # Cursor is exactly 4 bytes at offset 6
+    cursor = struct.unpack_from("<I", data, 6)[0]
 
-    if start is None:
-        return [], 0
-
-    # Extract hash cursor (bytes between header and first record).
-    cursor_bytes = data[6:start]
-    cursor = int.from_bytes(cursor_bytes, "little") if cursor_bytes else 0
-
+    # Records start at offset 10
     servers = []
-    pos = start
+    pos = 10
 
     while pos + 6 <= len(data):
         ip_bytes = data[pos:pos + 4]
