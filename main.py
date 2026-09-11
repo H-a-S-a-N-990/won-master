@@ -40,7 +40,7 @@ def query_master(host, port):
         packet = (
             b"\x31"
             b"\xff"
-            + b"0.0.0.0:0".encode("ascii")
+            + b"0.0.0.0:0"
             + b"\x00"
             + b"\\gamedir\\cstrike"
             + b"\x00"
