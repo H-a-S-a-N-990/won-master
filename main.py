@@ -6,10 +6,6 @@ import threading
 
 app = Flask(__name__)
 
-# ============================================================
-# WON2 MASTER SERVERS
-# ============================================================
-
 MASTERS = [
     "master.won2.steamlessproject.nl",
     "master2.won2.steamlessproject.nl",
@@ -18,21 +14,73 @@ MASTERS = [
 ]
 
 MASTER_PORT = 27010
+GAME_FILTER = b"\\gamedir\\*\\0"
 
-# ============================================================
-# MASTER SERVER QUERY
-# ============================================================
 
-def query_master(host):
+def parse_master_response(data):
+    """
+    Parse WON2 master response.
+
+    Header: FF FF FF FF 66 0A
+    Then: variable-length hash cursor
+    Then: 6-byte records (4 IP + 2 port big-endian)
+    """
+    if len(data) < 8:
+        return [], 0
+
+    if data[:5] != b"\xff\xff\xff\xff\x66":
+        return [], 0
+
+    # Find start of first valid server record.
+    # Rule: first 6-byte window where IP != 0.0.0.0 and port > 1024.
+    start = None
+    for offset in range(6, min(len(data) - 5, 20)):
+        ip_bytes = data[offset:offset + 4]
+        port_bytes = data[offset + 4:offset + 6]
+        port = int.from_bytes(port_bytes, "big")
+        if ip_bytes[0] != 0 and port > 1024:
+            start = offset
+            break
+
+    if start is None:
+        return [], 0
+
+    # Extract hash cursor (bytes between header and first record).
+    cursor_bytes = data[6:start]
+    cursor = int.from_bytes(cursor_bytes, "little") if cursor_bytes else 0
+
+    servers = []
+    pos = start
+
+    while pos + 6 <= len(data):
+        ip_bytes = data[pos:pos + 4]
+        port_bytes = data[pos + 4:pos + 6]
+        port = int.from_bytes(port_bytes, "big")
+        ip = ".".join(str(b) for b in ip_bytes)
+
+        # Terminator
+        if ip == "0.0.0.0" and port == 0:
+            break
+
+        # Sanity
+        if ip_bytes[0] == 0 or ip_bytes[0] >= 224 or port < 1024:
+            break
+
+        servers.append((ip, port))
+        pos += 6
+
+    return servers, cursor
+
+
+def query_master(host, max_pages=10):
     result = {
         "host": host,
         "ip": None,
-        "tx": "",
-        "rx": "",
-        "length": 0,
-        "time": 0,
+        "tx": [],
+        "rx": [],
         "servers": [],
-        "error": None
+        "error": None,
+        "pages": 0,
     }
 
     try:
@@ -42,152 +90,78 @@ def query_master(host):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(5)
 
-        # Standard Half-Life/WON master request
-        #
-        # 31             = '1' / server list request
-        # FF             = world region
-        # 30.30.30.30:0  = start address
-        # 00             = separator
-        # \gamedir\*     = all games
-        # 00             = terminator
-        #
-        packet = (
-            b"1"
-            + b"\xff"
-            + b"0.0.0.0:0"
-            + b"\x00"
-            + b"\\gamedir\\*"
-            + b"\x00"
-        )
+        cursor = None
 
-        result["tx"] = packet.hex(" ")
+        for page in range(max_pages):
+            # Build request
+            if cursor is None:
+                # Initial: string cursor 0.0.0.0:0
+                packet = b"1\xff" + b"0.0.0.0:0\x00" + GAME_FILTER
+            else:
+                # Subsequent: 4-byte hash cursor
+                packet = b"1\xff" + struct.pack("<I", cursor) + b"\x00" + GAME_FILTER
 
-        start = time.time()
+            result["tx"].append(packet.hex(" "))
 
-        sock.sendto(packet, (ip, MASTER_PORT))
+            sock.sendto(packet, (ip, MASTER_PORT))
+            data, _ = sock.recvfrom(65535)
 
-        data, addr = sock.recvfrom(65535)
+            result["rx"].append(data.hex(" "))
 
-        elapsed = (time.time() - start) * 1000
+            servers, next_cursor = parse_master_response(data)
 
-        result["time"] = round(elapsed, 2)
-        result["rx"] = data.hex(" ")
-        result["length"] = len(data)
+            if not servers:
+                break
+
+            result["servers"].extend(servers)
+            result["pages"] += 1
+
+            # If cursor is 0 or unchanged, stop
+            if next_cursor == 0 or next_cursor == cursor:
+                break
+
+            cursor = next_cursor
+            time.sleep(0.1)
 
         sock.close()
 
-        result["servers"] = parse_master_response(data)
+        # Deduplicate
+        seen = set()
+        unique = []
+        for ip_str, port in result["servers"]:
+            key = f"{ip_str}:{port}"
+            if key not in seen:
+                seen.add(key)
+                unique.append((ip_str, port))
+        result["servers"] = unique
 
     except Exception as e:
         result["error"] = str(e)
 
     return result
 
-# ============================================================
-# PARSE WON2 / HALF-LIFE MASTER RESPONSE
-# ============================================================
-
-def parse_master_response(data):
-    """
-    Parse FF FF FF FF 66 0A master response.
-
-    Standard records are:
-
-        4 bytes IP (little-endian)
-        2 bytes PORT (big-endian)
-
-    The header is followed by a variable-length hash cursor.
-    We determine the cursor length by scanning for the first
-    valid server record.
-    """
-
-    if len(data) < 12:
-        return []
-
-    header = b"\xff\xff\xff\xff\x66\x0a"
-
-    if not data.startswith(header):
-        return []
-
-    # Find the start of the first server record.
-    # The hash cursor is an unsigned long (4 bytes) but may
-    # be truncated if the value is small.
-    # We scan from offset 6 and look for a valid IP/port pair.
-    start_offset = None
-    for offset in range(6, len(data) - 5):
-        ip_bytes = data[offset:offset+4]
-        port_bytes = data[offset+4:offset+6]
-        port = int.from_bytes(port_bytes, "big")
-        # Basic sanity check for a real server.
-        if ip_bytes[0] != 0 and ip_bytes[0] < 224 and port > 1024:
-            start_offset = offset
-            break
-
-    if start_offset is None:
-        return []
-
-    records = []
-    pos = start_offset
-
-    while pos + 6 <= len(data):
-        ip_bytes = data[pos:pos+4]
-        port_bytes = data[pos+4:pos+6]
-        port = int.from_bytes(port_bytes, "big")
-        ip = ".".join(str(x) for x in ip_bytes)
-
-        # Stop on normal master terminator.
-        if ip == "0.0.0.0" and port == 0:
-            break
-
-        # Reject obviously bad candidates.
-        if ip_bytes[0] == 0 or ip_bytes[0] >= 224 or port < 1024:
-            break
-
-        records.append((ip, port))
-        pos += 6
-
-    # Remove duplicates.
-    final = []
-    seen = set()
-    for ip, port in records:
-        server = f"{ip}:{port}"
-        if server not in seen:
-            seen.add(server)
-            final.append(server)
-
-    return final
-
-# ============================================================
-# QUERY ALL MASTERS
-# ============================================================
 
 def query_all_masters():
     results = []
-
     threads = []
     lock = threading.Lock()
 
-    def worker(host):
-        result = query_master(host)
+    def worker(h):
+        r = query_master(h)
         with lock:
-            results.append(result)
+            results.append(r)
 
-    for host in MASTERS:
-        thread = threading.Thread(target=worker, args=(host,))
-        thread.start()
-        threads.append(thread)
+    for h in MASTERS:
+        t = threading.Thread(target=worker, args=(h,))
+        t.start()
+        threads.append(t)
 
-    for thread in threads:
-        thread.join()
+    for t in threads:
+        t.join()
 
-    # Keep the original master order.
     results.sort(key=lambda x: MASTERS.index(x["host"]))
-
     return results
 
-# ============================================================
-# HTML
-# ============================================================
 
 HTML = r"""
 <!DOCTYPE html>
@@ -203,46 +177,43 @@ button:hover { background: #444; }
 .master { background: #1b1b1b; border: 1px solid #444; border-radius: 8px; margin-top: 20px; padding: 18px; }
 .ok { color: #6cff6c; }
 .error { color: #ff6666; }
-.info { color: #aaa; }
 .server { background: #252525; border: 1px solid #444; padding: 8px; margin: 4px 0; border-radius: 4px; font-family: monospace; }
-pre { background: #080808; border: 1px solid #333; padding: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
+pre { background: #080808; border: 1px solid #333; padding: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: 11px; }
 .summary { background: #191919; padding: 15px; border: 1px solid #333; border-radius: 8px; margin-top: 20px; }
 </style>
 </head>
 <body>
 <h1>WON2 Master Server Browser</h1>
-<form method="get">
-    <button type="submit">Query Masters Again</button>
-</form>
+<form method="get"><button type="submit">Query Masters Again</button></form>
+
 {% if results %}
 <div class="summary">
 <b>Total unique servers:</b> {{ total_servers }}
 </div>
+
 {% for r in results %}
 <div class="master">
 <h2>{{ r.host }}:27010</h2>
 {% if r.error %}
 <div class="error">ERROR: {{ r.error }}</div>
 {% else %}
-<div class="ok">Server responded</div>
-<p>
-<b>Master IP:</b> {{ r.ip }}<br>
-<b>RX length:</b> {{ r.length }} bytes<br>
-<b>Query time:</b> {{ r.time }} ms<br>
-<b>Servers parsed:</b> {{ r.servers|length }}
-</p>
+<div class="ok">Responded — {{ r.pages }} page(s), {{ r.servers|length }} unique servers</div>
+<p><b>Master IP:</b> {{ r.ip }}</p>
+
 <h3>Servers</h3>
-{% if r.servers %}
-{% for server in r.servers %}
-<div class="server">{{ server }}</div>
+{% for ip, port in r.servers %}
+<div class="server">{{ ip }}:{{ port }}</div>
 {% endfor %}
-{% else %}
-<div class="error">No valid server records found.</div>
-{% endif %}
-<h3>TX</h3>
-<pre>{{ r.tx }}</pre>
-<h3>RX</h3>
-<pre>{{ r.rx }}</pre>
+
+<h3>TX (requests)</h3>
+{% for tx in r.tx %}
+<pre>{{ tx }}</pre>
+{% endfor %}
+
+<h3>RX (responses)</h3>
+{% for rx in r.rx %}
+<pre>{{ rx }}</pre>
+{% endfor %}
 {% endif %}
 </div>
 {% endfor %}
@@ -251,34 +222,25 @@ pre { background: #080808; border: 1px solid #333; padding: 12px; overflow-x: au
 </html>
 """
 
-# ============================================================
-# ROUTES
-# ============================================================
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     results = query_all_masters()
     unique = set()
-    for result in results:
-        for server in result["servers"]:
-            unique.add(server)
+    for r in results:
+        for ip, port in r["servers"]:
+            unique.add(f"{ip}:{port}")
     return render_template_string(
         HTML,
         results=results,
-        total_servers=len(unique)
+        total_servers=len(unique),
     )
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
 
 @app.route("/health")
 def health():
     return "OK"
 
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
