@@ -1,10 +1,11 @@
 from flask import Flask, Response
 import socket
 import struct
+import os
 
 app = Flask(__name__)
 
-WON2_MASTERS = [
+MASTERS = [
     ("master.won2.steamlessproject.nl", 27010),
     ("master2.won2.steamlessproject.nl", 27010),
     ("master3.won2.steamlessproject.nl", 27010),
@@ -17,58 +18,75 @@ def query_master(host, port):
     sock.settimeout(5)
 
     servers = set()
-    start = b"0.0.0.0:0"
+    start = "0.0.0.0:0"
 
     try:
         while True:
+            # WON/GoldSrc master query
             packet = (
-                b"\x31"          # master query
-                + b"\xff"        # world
-                + start          # ASCII IP:port
-                + b"\x00"        # end of address
+                b"\x31"
+                + b"\xff"
+                + start.encode("ascii")
+                + b"\x00"
             )
 
             sock.sendto(packet, (host, port))
 
             data, addr = sock.recvfrom(8192)
 
-            # Master response:
-            # FF FF FF FF 66 0A
+            print(
+                "MASTER",
+                host,
+                "RX",
+                len(data),
+                "bytes:",
+                data.hex(" ")
+            )
+
             if not data.startswith(b"\xff\xff\xff\xff\x66\x0a"):
-                print("Bad master response:", data.hex(" "))
+                print("Unexpected master response")
                 break
 
             payload = data[6:]
 
-            # Every server is:
-            # 4 bytes IP + 2 bytes PORT
             if len(payload) < 6:
                 break
 
-            old_start = start
+            previous_start = start
+            last_server = None
 
+            # EXACTLY 6 bytes per server:
+            # 4-byte IPv4 + 2-byte big-endian port
             for i in range(0, len(payload) - 5, 6):
-                ip = socket.inet_ntoa(payload[i:i + 4])
-                server_port = struct.unpack(">H", payload[i + 4:i + 6])[0]
+                ip_bytes = payload[i:i + 4]
+                port_bytes = payload[i + 4:i + 6]
 
-                # Ignore invalid terminator
+                ip = socket.inet_ntoa(ip_bytes)
+                server_port = struct.unpack(">H", port_bytes)[0]
+
+                # End marker
                 if ip == "0.0.0.0" and server_port == 0:
                     continue
 
-                servers.add(f"{ip}:{server_port}")
+                address = "{}:{}".format(ip, server_port)
 
-                # Continue from the last returned server
-                start = (
-                    ip.encode("ascii")
-                    + b":"
-                    + str(server_port).encode("ascii")
-                )
+                servers.add(address)
+                last_server = address
 
-            if start == old_start:
+            if last_server is None:
                 break
 
-    except socket.timeout:
-        print(host, "timed out")
+            start = last_server
+
+            if start == previous_start:
+                break
+
+    except Exception as e:
+        print(
+            "MASTER ERROR {}:{} -> {}".format(
+                host, port, repr(e)
+            )
+        )
 
     finally:
         sock.close()
@@ -76,35 +94,53 @@ def query_master(host, port):
     return servers
 
 
-@app.route("/masters")
-def masters():
-    all_servers = []
-    seen = set()
+@app.route("/")
+def index():
+    all_servers = set()
+    errors = []
 
-    for host, port in WON2_MASTERS:
-        servers = get_master_servers(host, port)
+    for host, port in MASTERS:
+        try:
+            found = query_master(host, port)
+            all_servers.update(found)
+        except Exception as e:
+            errors.append(
+                "{}:{} -> {}".format(host, port, repr(e))
+            )
 
-        for server in servers:
-            if server not in seen:
-                seen.add(server)
-                all_servers.append(server)
+    lines = []
 
-    # RAW TEXT
-    output = "\n".join(all_servers)
+    lines.append("WON2 MASTER SERVER BROWSER")
+    lines.append("=" * 40)
+    lines.append("")
+    lines.append("Servers found: {}".format(len(all_servers)))
+    lines.append("")
+
+    for server in sorted(all_servers):
+        lines.append(server)
+
+    if errors:
+        lines.append("")
+        lines.append("=" * 40)
+        lines.append("ERRORS")
+        lines.append("=" * 40)
+
+        for error in errors:
+            lines.append(error)
 
     return Response(
-        output,
+        "\n".join(lines),
         mimetype="text/plain"
     )
 
 
-@app.route("/")
-def index():
-    return """
-    <h1>WON2 Master Servers</h1>
-    <p><a href="/masters">Show raw IP:PORT list</a></p>
-    """
+@app.route("/health")
+def health():
+    return "OK"
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000))
+    )
