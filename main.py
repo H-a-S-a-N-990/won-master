@@ -43,43 +43,129 @@ def query_master(host):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(5)
 
-        # Standard Half-Life/WON master request
-        #
-        # 31             = '1' / server list request
-        # FF             = world region
-        # 30.30.30.30:0  = start address
-        # 00             = separator
-        # \gamedir\*     = all games
-        # 00             = terminator
-        #
-        packet = (
-            b"1"
-            + b"\xff"
-            + b"0.0.0.0:0"
-            + b"\x00"
-            + b"\\gamedir\\*"
-            + b"\x00"
-        )
+        all_servers = []
+        seen_servers = set()
+        seen_cursors = set()
 
-        result["tx"] = packet.hex(" ")
+        # ----------------------------------------------------
+        # First request starts at 0.0.0.0:0
+        # ----------------------------------------------------
 
-        start = time.time()
+        cursor = "0.0.0.0:0"
 
-        sock.sendto(packet, (ip, MASTER_PORT))
+        first_tx = ""
+        first_rx = ""
+        first_length = 0
 
-        data, addr = sock.recvfrom(65535)
+        total_start = time.time()
 
-        elapsed = (time.time() - start) * 1000
+        # ----------------------------------------------------
+        # Continue requesting pages
+        # ----------------------------------------------------
 
-        result["time"] = round(elapsed, 2)
-        result["rx"] = data.hex(" ")
-        result["length"] = len(data)
+        for page in range(20):
+
+            packet = (
+                b"1"
+                + b"\xff"
+                + cursor.encode("ascii")
+                + b"\x00"
+                + b"\\gamedir\\*"
+                + b"\x00"
+            )
+
+            # Save first request for diagnostics
+            if page == 0:
+                first_tx = packet.hex(" ")
+
+            page_start = time.time()
+
+            sock.sendto(
+                packet,
+                (ip, MASTER_PORT)
+            )
+
+            data, addr = sock.recvfrom(65535)
+
+            page_time = (time.time() - page_start) * 1000
+
+            # Save first response for diagnostics
+            if page == 0:
+                first_rx = data.hex(" ")
+                first_length = len(data)
+                result["time"] = round(page_time, 2)
+
+            # ------------------------------------------------
+            # Parse this page
+            # ------------------------------------------------
+
+            servers, finished = parse_master_response(data)
+
+            if not servers:
+                break
+
+            new_servers = 0
+
+            # ------------------------------------------------
+            # Add new servers
+            # ------------------------------------------------
+
+            for server in servers:
+
+                if server not in seen_servers:
+
+                    seen_servers.add(server)
+                    all_servers.append(server)
+
+                    new_servers += 1
+
+            # ------------------------------------------------
+            # Normal end marker
+            # ------------------------------------------------
+
+            if finished:
+                break
+
+            # ------------------------------------------------
+            # Last server becomes next cursor
+            # ------------------------------------------------
+
+            last_server = servers[-1]
+
+            # Prevent endless loops
+            if last_server == cursor:
+                break
+
+            if last_server in seen_cursors:
+                break
+
+            seen_cursors.add(last_server)
+
+            cursor = last_server
+
+            # If the master gave us nothing new, stop
+            if new_servers == 0:
+                break
 
         sock.close()
 
-        result["servers"] = parse_master_response(data)
+        # ----------------------------------------------------
+        # Final result
+        # ----------------------------------------------------
+
+        result["servers"] = all_servers
+
+        result["tx"] = first_tx
+        result["rx"] = first_rx
+        result["length"] = first_length
+
+        result["time"] = round(
+            (time.time() - total_start) * 1000,
+            2
+        )
 
     except Exception as e:
+
         result["error"] = str(e)
 
     return result
@@ -91,97 +177,121 @@ def query_master(host):
 
 def parse_master_response(data):
     """
-    Parse FF FF FF FF 66 0A master response.
+    Parse a WON/WON2 master response.
 
-    Standard records are:
+    Normal response header:
+
+        FF FF FF FF 66 0A
+
+    The currently observed WON2 response contains:
+
+        FF FF FF FF 66 0A 00 00
+
+    so server records begin at offset 8.
+
+    Each server record:
 
         4 bytes IP
         2 bytes PORT
 
-    Port is BIG-ENDIAN.
+    IP is represented directly as four bytes.
 
-    WON2 responses observed here contain bytes before the first
-    normal 6-byte server record, so we search for the strongest
-    aligned sequence instead of blindly starting at byte 6.
+    Port is BIG-ENDIAN / network byte order.
+
+    Example:
+
+        31 e8 dd e5 51 4a
+
+    becomes:
+
+        49.232.221.229:20810
+
+    A 0.0.0.0:0 record is treated as the end marker.
     """
 
     if len(data) < 12:
-        return []
+        return [], False
 
     header = b"\xff\xff\xff\xff\x66\x0a"
 
     if not data.startswith(header):
-        return []
-
-    best_records = []
+        return [], False
 
     # --------------------------------------------------------
-    # Try every possible starting offset.
+    # WON2 observed format has 00 00 after the header
     # --------------------------------------------------------
 
-    for offset in range(6, len(data) - 5):
+    if len(data) >= 8 and data[6:8] == b"\x00\x00":
 
-        records = []
+        offset = 8
 
-        pos = offset
+    else:
 
-        while pos + 6 <= len(data):
+        offset = 6
 
-            ip_bytes = data[pos:pos + 4]
-            port_bytes = data[pos + 4:pos + 6]
-
-            port = int.from_bytes(port_bytes, "big")
-
-            # IP
-            ip = ".".join(str(x) for x in ip_bytes)
-
-            # Stop on normal master terminator
-            if ip == "0.0.0.0" and port == 0:
-                break
-
-            # ------------------------------------------------
-            # Reject obviously bad candidates.
-            # ------------------------------------------------
-
-            if ip_bytes[0] == 0:
-                break
-
-            if ip_bytes[0] >= 224:
-                break
-
-            if port < 1024:
-                break
-
-            # GoldSrc/WON ports are commonly around this range.
-            # We allow a broad range so unusual servers still work.
-            if port > 65535:
-                break
-
-            records.append((ip, port))
-
-            pos += 6
-
-        # Prefer the offset producing the largest consecutive
-        # valid sequence.
-        if len(records) > len(best_records):
-            best_records = records
+    servers = []
+    finished = False
 
     # --------------------------------------------------------
-    # Remove duplicates.
+    # Read 6-byte server records
     # --------------------------------------------------------
 
-    final = []
-    seen = set()
+    while offset + 6 <= len(data):
 
-    for ip, port in best_records:
+        ip_bytes = data[offset:offset + 4]
 
-        server = f"{ip}:{port}"
+        port_bytes = data[offset + 4:offset + 6]
 
-        if server not in seen:
-            seen.add(server)
-            final.append(server)
+        # ----------------------------------------------------
+        # IP
+        # ----------------------------------------------------
 
-    return final
+        ip = ".".join(
+            str(x)
+            for x in ip_bytes
+        )
+
+        # ----------------------------------------------------
+        # Port
+        # ----------------------------------------------------
+
+        port = int.from_bytes(
+            port_bytes,
+            "big"
+        )
+
+        # ----------------------------------------------------
+        # End marker
+        # ----------------------------------------------------
+
+        if ip == "0.0.0.0" and port == 0:
+
+            finished = True
+            break
+
+        # ----------------------------------------------------
+        # Ignore FF FF FF FF : 65535
+        # ----------------------------------------------------
+
+        if (
+            ip_bytes == b"\xff\xff\xff\xff"
+            and port == 65535
+        ):
+
+            offset += 6
+            continue
+
+        # ----------------------------------------------------
+        # Add server
+        # ----------------------------------------------------
+
+        servers.append(
+            f"{ip}:{port}"
+        )
+
+        offset += 6
+
+    return servers, finished
 
 
 # ============================================================
@@ -189,9 +299,11 @@ def parse_master_response(data):
 # ============================================================
 
 def query_all_masters():
+
     results = []
 
     threads = []
+
     lock = threading.Lock()
 
     def worker(host):
@@ -199,7 +311,12 @@ def query_all_masters():
         result = query_master(host)
 
         with lock:
+
             results.append(result)
+
+    # --------------------------------------------------------
+    # Query all masters simultaneously
+    # --------------------------------------------------------
 
     for host in MASTERS:
 
@@ -209,14 +326,25 @@ def query_all_masters():
         )
 
         thread.start()
+
         threads.append(thread)
 
+    # --------------------------------------------------------
+    # Wait for all masters
+    # --------------------------------------------------------
+
     for thread in threads:
+
         thread.join()
 
-    # Keep the original master order
+    # --------------------------------------------------------
+    # Keep original master order
+    # --------------------------------------------------------
+
     results.sort(
-        key=lambda x: MASTERS.index(x["host"])
+        key=lambda x: MASTERS.index(
+            x["host"]
+        )
     )
 
     return results
@@ -318,7 +446,11 @@ pre {
 <h1>WON2 Master Server Browser</h1>
 
 <form method="get">
-    <button type="submit">Query Masters Again</button>
+
+    <button type="submit">
+        Query Masters Again
+    </button>
+
 </form>
 
 {% if results %}
@@ -339,20 +471,41 @@ pre {
 {% if r.error %}
 
 <div class="error">
+
     ERROR: {{ r.error }}
+
 </div>
 
 {% else %}
 
 <div class="ok">
+
     Server responded
+
 </div>
 
 <p>
-<b>Master IP:</b> {{ r.ip }}<br>
-<b>RX length:</b> {{ r.length }} bytes<br>
-<b>Query time:</b> {{ r.time }} ms<br>
-<b>Servers parsed:</b> {{ r.servers|length }}
+
+<b>Master IP:</b>
+{{ r.ip }}
+
+<br>
+
+<b>RX length:</b>
+{{ r.length }}
+bytes
+
+<br>
+
+<b>Query time:</b>
+{{ r.time }}
+ms
+
+<br>
+
+<b>Servers parsed:</b>
+{{ r.servers|length }}
+
 </p>
 
 <h3>Servers</h3>
@@ -362,7 +515,9 @@ pre {
 {% for server in r.servers %}
 
 <div class="server">
+
     {{ server }}
+
 </div>
 
 {% endfor %}
@@ -370,7 +525,9 @@ pre {
 {% else %}
 
 <div class="error">
+
     No valid server records found.
+
 </div>
 
 {% endif %}
@@ -410,6 +567,7 @@ def index():
     for result in results:
 
         for server in result["servers"]:
+
             unique.add(server)
 
     return render_template_string(
@@ -425,6 +583,7 @@ def index():
 
 @app.route("/health")
 def health():
+
     return "OK"
 
 
@@ -438,4 +597,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=5000,
         debug=False
-    )
+        )
