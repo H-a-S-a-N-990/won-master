@@ -8,6 +8,9 @@ app = Flask(__name__)
 # WON2 master server
 MASTERS = [
     ("master.won2.steamlessproject.nl", 27010),
+    ("master2.won2.steamlessproject.nl", 27010),
+    ("master3.won2.steamlessproject.nl", 27010),
+    ("master4.won2.steamlessproject.nl", 27010),
 ]
 
 
