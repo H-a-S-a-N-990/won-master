@@ -179,34 +179,27 @@ def parse_master_response(data):
     """
     Parse a WON/WON2 master response.
 
-    Normal response header:
+    Header:
 
         FF FF FF FF 66 0A
 
-    The currently observed WON2 response contains:
-
-        FF FF FF FF 66 0A 00 00
-
-    so server records begin at offset 8.
-
-    Each server record:
-
-        4 bytes IP
-        2 bytes PORT
-
-    IP is represented directly as four bytes.
-
-    Port is BIG-ENDIAN / network byte order.
+    WON2 may contain a variable number of zero bytes after
+    the header before the first server record.
 
     Example:
 
-        31 e8 dd e5 51 4a
+        FF FF FF FF 66 0A 00 00 5E 1A A7 1A 69 8C
 
-    becomes:
+    or:
 
-        49.232.221.229:20810
+        FF FF FF FF 66 0A 00 00 00 00 5E 1A A7 1A 69 8C
 
-    A 0.0.0.0:0 record is treated as the end marker.
+    Server records:
+
+        4 bytes IP
+        2 bytes port
+
+    Port is BIG-ENDIAN.
     """
 
     if len(data) < 12:
@@ -218,42 +211,30 @@ def parse_master_response(data):
         return [], False
 
     # --------------------------------------------------------
-    # WON2 observed format has 00 00 after the header
+    # Skip variable zero padding after the header
     # --------------------------------------------------------
 
-    if len(data) >= 8 and data[6:8] == b"\x00\x00":
+    offset = 6
 
-        offset = 8
+    while offset < len(data) and data[offset] == 0:
+        offset += 1
 
-    else:
-
-        offset = 6
+    # --------------------------------------------------------
+    # Parse 6-byte server records
+    # --------------------------------------------------------
 
     servers = []
     finished = False
 
-    # --------------------------------------------------------
-    # Read 6-byte server records
-    # --------------------------------------------------------
-
     while offset + 6 <= len(data):
 
         ip_bytes = data[offset:offset + 4]
-
         port_bytes = data[offset + 4:offset + 6]
-
-        # ----------------------------------------------------
-        # IP
-        # ----------------------------------------------------
 
         ip = ".".join(
             str(x)
             for x in ip_bytes
         )
-
-        # ----------------------------------------------------
-        # Port
-        # ----------------------------------------------------
 
         port = int.from_bytes(
             port_bytes,
@@ -265,7 +246,6 @@ def parse_master_response(data):
         # ----------------------------------------------------
 
         if ip == "0.0.0.0" and port == 0:
-
             finished = True
             break
 
@@ -277,7 +257,6 @@ def parse_master_response(data):
             ip_bytes == b"\xff\xff\xff\xff"
             and port == 65535
         ):
-
             offset += 6
             continue
 
@@ -292,7 +271,6 @@ def parse_master_response(data):
         offset += 6
 
     return servers, finished
-
 
 # ============================================================
 # QUERY ALL MASTERS
