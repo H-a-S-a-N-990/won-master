@@ -12,64 +12,63 @@ WON2_MASTERS = [
 ]
 
 
-def get_master_servers(master_host, master_port):
-    servers = []
-    seen = set()
-
+def query_master(host, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(5)
 
-    try:
-        last_ip = "0.0.0.0"
-        last_port = 0
+    servers = set()
+    start = b"0.0.0.0:0"
 
+    try:
         while True:
-            # Master server query
             packet = (
-                b"\x31"
-                + b"\xff"
-                + socket.inet_aton(last_ip)
-                + struct.pack(">H", last_port)
-                + b"\x00"
+                b"\x31"          # master query
+                + b"\xff"        # world
+                + start          # ASCII IP:port
+                + b"\x00"        # end of address
             )
 
-            sock.sendto(packet, (master_host, master_port))
+            sock.sendto(packet, (host, port))
 
-            data, addr = sock.recvfrom(65535)
+            data, addr = sock.recvfrom(8192)
 
-            # Master response header
+            # Master response:
+            # FF FF FF FF 66 0A
             if not data.startswith(b"\xff\xff\xff\xff\x66\x0a"):
+                print("Bad master response:", data.hex(" "))
                 break
 
             payload = data[6:]
 
+            # Every server is:
+            # 4 bytes IP + 2 bytes PORT
             if len(payload) < 6:
                 break
 
-            old_last = (last_ip, last_port)
+            old_start = start
 
             for i in range(0, len(payload) - 5, 6):
                 ip = socket.inet_ntoa(payload[i:i + 4])
-                port = struct.unpack(">H", payload[i + 4:i + 6])[0]
+                server_port = struct.unpack(">H", payload[i + 4:i + 6])[0]
 
-                address = "%s:%d" % (ip, port)
+                # Ignore invalid terminator
+                if ip == "0.0.0.0" and server_port == 0:
+                    continue
 
-                if address not in seen:
-                    seen.add(address)
-                    servers.append(address)
+                servers.add(f"{ip}:{server_port}")
 
-                last_ip = ip
-                last_port = port
+                # Continue from the last returned server
+                start = (
+                    ip.encode("ascii")
+                    + b":"
+                    + str(server_port).encode("ascii")
+                )
 
-            # End of master list
-            if (last_ip, last_port) == old_last:
+            if start == old_start:
                 break
 
     except socket.timeout:
-        pass
-
-    except Exception as e:
-        print("Master error:", master_host, e)
+        print(host, "timed out")
 
     finally:
         sock.close()
